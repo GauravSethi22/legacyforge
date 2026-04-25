@@ -71,12 +71,12 @@ async def read_item(item_id: int):
         raise HTTPException(status_code=404, detail="Item not found")
     return ItemResponse(item_id=item_id, name=f"Item {item_id}")
 
-
 ACTION ORDER:
-1. Call read_docs once (topic: "routing" or "pydantic") - max 2 times
-2. Call edit_function with the COMPLETE corrected FastAPI module as new_code
-3. Call run_tests to check passage rate
-4. If passage >= 70%, call submit_test with an adversarial test
+1. Call read_docs
+2. Call edit_function
+3. Call run_tests
+4. If passage < 70%, call code_review to analyze the test failures, THEN call edit_function again.
+5. If passage >= 70%, call submit_test
 
 CRITICAL: For edit_function, new_code must be the ENTIRE module -
 all imports, app = FastAPI(), models, and route handlers.
