@@ -193,7 +193,8 @@ class LegacyforgeEnvironment(Environment):
         self.challenger_win_rate = 0.0
         self.test_passage_rate = 0.0
         self.working_code = _LEVEL1_INITIAL_CODE
-        
+
+        self.max_passed = 0  # <--- FIX: Add this line!
         self.read_docs_count = 0
         self.edit_count = 0
         self.run_tests_count = 0
@@ -203,7 +204,7 @@ class LegacyforgeEnvironment(Environment):
         self.passage_milestones_hit = set()
         self.edited_since_last_test = False
         self.read_docs_before_first_edit = False
-        self.run_tests_after_every_edit = True
+        self.perfect_test_discipline = True
         self.submit_before_phase2 = False
 
     # -----------------------------------------------------------------------
@@ -232,7 +233,7 @@ class LegacyforgeEnvironment(Environment):
         reward = 0.0
         done = False
         info: dict = {}
-        
+
         # Step-local breakdown components
         progress_bonus = 0.0
         migration_success_reward = 0.0
@@ -247,24 +248,28 @@ class LegacyforgeEnvironment(Environment):
                 reward = -0.5
             if self.edit_count == 0:
                 self.read_docs_before_first_edit = True
-            
+
             # call handler just for info/summary
             _, summary, info = self._handle_read_docs(action)
 
         elif action_type == "edit_function":
             self.edit_count += 1
+
+            if self.edited_since_last_test:
+                self.perfect_test_discipline = False
+
             self.edited_since_last_test = True
-            
+
             _, summary, info = self._handle_edit_function(action)
-            
+
             if info.get("compile_ok"):
-                # FIX ISSUE 1: no double-penalty — step reward is 0.2 if docs read, else 0.0
-                # strategy_score at episode-end still penalises skipping docs
-                reward = 0.2 if self.read_docs_count > 0 else 0.0
+                if self.edited_since_last_test and self.edit_count > 1:
+                    reward = -0.1
+                else:
+                    reward = 0.0
             else:
                 reward = -0.5
-                
-            self.run_tests_after_every_edit = False
+                self.run_tests_after_every_edit = False
 
         elif action_type == "run_tests":
             if not self.edited_since_last_test:
@@ -277,6 +282,12 @@ class LegacyforgeEnvironment(Environment):
                     test_code = f.read()
 
                 result = run_in_sandbox(self.working_code, test_code)
+
+                # --- ADDED DEBUG PRINTS HERE ---
+                print(f"\n{'-'*60}\n[DEBUG run_tests] Pytest Output:\n{result.get('output', '')}")
+                if result.get('error'):
+                    print(f"\n[DEBUG run_tests] Pytest Errors:\n{result.get('error', '')}")
+                print(f"{'-'*60}\n")
 
                 # Determine if the sandbox actually produced parseable results
                 sandbox_ok = not result["timed_out"] and not (
@@ -292,15 +303,27 @@ class LegacyforgeEnvironment(Environment):
                     self.test_passage_rate = 0.0
                 else:
                     output = result["output"]
-                    passed_match = re.search(r"(\d+) passed", output)
-                    failed_match = re.search(r"(\d+) failed", output)
-                    passed = int(passed_match.group(1)) if passed_match else (3 if result["passed"] else 0)
-                    failed = int(failed_match.group(1)) if failed_match else (0 if result["passed"] else 3)
+
+                    # More strict regex targeting the pytest summary line
+                    passed_match = re.search(r"={2,}.*?(\d+)\s+passed", output)
+                    failed_match = re.search(r"={2,}.*?(\d+)\s+failed", output)
+
+                    raw_passed = int(passed_match.group(1)) if passed_match else (self.test_suite_size if result["passed"] else 0)
+                    raw_failed = int(failed_match.group(1)) if failed_match else (0 if result["passed"] else self.test_suite_size)
+
+                    # FIX: Cap the parsed results to prevent spoofing exploits
+                    passed = min(raw_passed, self.test_suite_size)
+                    failed = min(raw_failed, self.test_suite_size)
                     total_tests = passed + failed or self.test_suite_size
 
-                    reward = passed * 0.5 - failed * 0.2
-                    migration_success_reward = reward
+                    delta_passed = passed - self.max_passed
+                    if delta_passed > 0:
+                        reward = delta_passed * 0.5
+                        self.max_passed = passed
+                    else:
+                        reward = 0.0
 
+                    reward -= failed * 0.2
                     self.test_passage_rate = passed / total_tests
                     self.history.update_from_output(output + result.get("error", ""))
 
@@ -322,7 +345,6 @@ class LegacyforgeEnvironment(Environment):
                     reward += progress_bonus
 
                 self.edited_since_last_test = False
-                self.run_tests_after_every_edit = True
                 self.run_tests_count += 1
                 summary = f"run_tests: passage={self.test_passage_rate:.2f}"
                 info.update({
@@ -348,7 +370,15 @@ class LegacyforgeEnvironment(Environment):
                 info["error"] = summary
             else:
                 test_code = action.code or ""
+
+                # --- ADDED DEBUG PRINT FOR SUBMITTED CODE ---
+                print(f"\n{'-'*60}\n[DEBUG submit_test] Submitted Test Code:\n{test_code}\n{'-'*60}\n")
+
                 result = validate_test(test_code, self.working_code)
+
+                # --- ADDED DEBUG PRINT FOR VALIDATION RESULT ---
+                print(f"[DEBUG submit_test] Validation Result:\n{result}\n{'-'*60}\n")
+
                 reason = result.get("reason", "unknown")
                 if result.get("accepted"):
                     reward = 3.0
@@ -380,8 +410,7 @@ class LegacyforgeEnvironment(Environment):
         if done:
             if self.read_docs_before_first_edit:
                 strategy_score += 1.0
-            # ISSUE 3 FIX: only reward run_tests discipline if at least one edit happened
-            if self.run_tests_after_every_edit and self.edit_count > 0:
+            if self.perfect_test_discipline and self.edit_count > 0:
                 strategy_score += 1.0
             if not self.submit_before_phase2:
                 strategy_score += 1.0
@@ -393,6 +422,8 @@ class LegacyforgeEnvironment(Environment):
                 strategy_score += 1.0
             elif self._state.step_count < 15:
                 strategy_score += 0.5
+
+            reward += strategy_score
 
         self.episode_log.append({"action": action_type, "step": self._state.step_count,
                                   "reward": reward, "summary": summary})

@@ -85,10 +85,9 @@ def build_cache(urls: list[str]) -> dict[str, str]:
                 resp.raise_for_status()
                 snippets = extract_python_snippets(resp.text)
                 if snippets:
-                    cache[key] = "\n\n---\n\n".join(snippets)
+                    formatted_snippets = [f"```python\n{s}\n```" for s in snippets]
+                    cache[key] = "\n\n---\n\n".join(formatted_snippets)
                     print(f"{len(snippets)} snippet(s)")
-                else:
-                    print("no Python snippets found, skipping")
             except Exception as exc:
                 print(f"ERROR: {exc}")
 

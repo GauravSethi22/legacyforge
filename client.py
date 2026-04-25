@@ -55,7 +55,9 @@ class LegacyforgeEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
-            "message": action.message,
+            "action_type": action.action_type,
+            "target": action.target,
+            "code": action.code,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[LegacyforgeObservation]:
@@ -70,11 +72,14 @@ class LegacyforgeEnv(
         """
         obs_data = payload.get("observation", {})
         observation = LegacyforgeObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+            legacy_code=obs_data.get("legacy_code", ""),
+            docs=obs_data.get("docs", ""),
+            migration_history_summary=obs_data.get("migration_history_summary", ""),
+            level=obs_data.get("level", 1),
             done=payload.get("done", False),
             reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+            info=payload.get("info", {}),
+            reward_breakdown=payload.get("reward_breakdown", {})
         )
 
         return StepResult(

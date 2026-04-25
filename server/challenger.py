@@ -20,16 +20,21 @@ def read_item(item_id: int):
 def run_challenger(code: str) -> dict:
     """
     Simulates a junior developer submitting buggy code against the test suite.
-    `code` is the test code written by the agent.
-    If the test PASSES against this buggy code, the test failed its job (it's too easy).
     """
     result = run_in_sandbox(BUGGY_CHALLENGER_CODE, code)
-    
+
+    # FIX: Check for sandbox crashes and timeouts first!
+    if result.get("timed_out", False):
+        return {"passed": False, "failed_tests": [], "reason_code": "broken_logic"}
+
+    error_output = result.get("error", "") + result.get("output", "")
+    if "SyntaxError" in error_output or "ImportError" in error_output or "NameError" in error_output:
+        return {"passed": False, "failed_tests": [], "reason_code": "broken_logic"}
+
     if result["passed"]:
         # The test suite passed successfully even though the code has bugs!
-        # This means the test didn't catch the bugs.
-        # We arbitrarily assign one of the reasons.
-        return {"passed": True, "failed_tests": [], "reason_code": "wrong_status"}
+        # This means the test didn't catch the bugs (it's too easy/permissive).
+        return {"passed": True, "failed_tests": [], "reason_code": "too_easy"}
     else:
-        # The test suite failed, which means it successfully caught the bugs!
+        # The test suite failed normally, which means it successfully caught the bugs!
         return {"passed": False, "failed_tests": ["caught_bug"], "reason_code": ""}

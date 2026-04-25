@@ -15,6 +15,7 @@ description = "Legacyforge environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
     "beautifulsoup4>=4.14.3",
+    "docker>=7.1.0",
     "httpx>=0.28.1",
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
     # install from github
@@ -31,6 +32,7 @@ dependencies = [
     # "openspiel>=1.0.0",
     # "smolagents>=1.22.0,<2",
     "pytest>=9.0.3",
+    "requests>=2.33.1",
 ]
 
 [project.optional-dependencies]

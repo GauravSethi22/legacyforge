@@ -31,7 +31,7 @@ from server.legacyforge_env import LegacyforgeEnvironment  # type: ignore
 from models import LegacyforgeAction  # type: ignore
 
 MODEL_ID       = "llama-3.1-8b-instant"
-NUM_EPISODES   = 10
+NUM_EPISODES   = 3
 MAX_ACTIONS    = 20
 OUTPUT_FILE    = os.path.join(_HERE, "baseline_results.json")
 
@@ -46,13 +46,14 @@ You are migrating a Flask app to FastAPI. Your goal: make ALL tests pass.
 
 THE TESTS EXPECT:
 - A module with `app = FastAPI()` that can be imported
-- GET /items/{{item_id}} returns 200 with {{"item_id": int, "name": str}}
-- GET /items/0 returns 404
+- GET /items/{item_id} returns 200 with {"item_id": int, "name": str}
+- The `name` MUST be unique per item_id (e.g., f"Item {item_id}")
+- item_id <= 0 MUST return 422 (Validation Error)
+- item_id > 1000 MUST return 404 (Not Found)
 - You MUST use `from fastapi import FastAPI, HTTPException`
 - You MUST use async def
 
 TARGET STRUCTURE (this is what passing code looks like):
-```
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -62,12 +63,14 @@ class ItemResponse(BaseModel):
     item_id: int
     name: str
 
-@app.get("/items/{{item_id}}", response_model=ItemResponse)
+@app.get("/items/{item_id}", response_model=ItemResponse)
 async def read_item(item_id: int):
-    if item_id > 0:
-        return ItemResponse(item_id=item_id, name="Test Item")
-    raise HTTPException(status_code=404, detail="Item not found")
-```
+    if item_id <= 0:
+        raise HTTPException(status_code=422, detail="Item ID must be positive")
+    if item_id > 1000:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return ItemResponse(item_id=item_id, name=f"Item {item_id}")
+
 
 ACTION ORDER:
 1. Call read_docs once (topic: "routing" or "pydantic") - max 2 times
@@ -79,32 +82,55 @@ CRITICAL: For edit_function, new_code must be the ENTIRE module -
 all imports, app = FastAPI(), models, and route handlers.
 NOT just a single function.
 
-RESPONSE FORMAT (JSON only, no markdown):
-{{"action": "<name>", "params": {{<params>}}}}
+RESPONSE FORMAT (Strict JSON only, no markdown):
+{"action": "edit_function", "params": {"name": "module", "new_code": "<INSERT_ENTIRE_MODULE_CODE_HERE_AS_ESCAPED_STRING>"}}
 """
-
 
 def extract_json(text: str) -> dict:
     # Strip markdown fences
-    text = text.strip()
     text = re.sub(r"```json|```", "", text).strip()
-    
-    # Extract FIRST valid JSON object only
-    # Find first { and its matching closing }
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found")
-    
+
+    # Find all potential JSON objects using regex
+    # This looks for matching curly braces (handling basic nesting)
+    #json_pattern = re.compile(r'\{(?:[^{}]|(?R))*\}')
+
+    # Try the simple approach first: if the whole text parses, use it
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # If not, extract all { ... } blocks
+    blocks = []
     depth = 0
-    for i, ch in enumerate(text[start:], start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
+    start = -1
+    for i, char in enumerate(text):
+        if char == '{':
             if depth == 0:
-                return json.loads(text[start:i+1])
-    
-    raise ValueError("No complete JSON object found")
+                start = i
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0 and start != -1:
+                blocks.append(text[start:i+1])
+                start = -1
+
+    # Search through the extracted blocks for a valid action
+    last_valid_json = None
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+            last_valid_json = parsed
+            # If we find a block that specifically has the 'action' key, return it immediately
+            if isinstance(parsed, dict) and "action" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    if last_valid_json is not None:
+        return last_valid_json
+
+    raise ValueError("No valid JSON object containing an action was found.")
 
 def call_model(user_msg: str, rate_limit_hits: list) -> dict | None:
     payload = {
@@ -142,12 +168,14 @@ def call_model(user_msg: str, rate_limit_hits: list) -> dict | None:
 
         except (json.JSONDecodeError, ValueError) as e:
             return {"_raw": raw, "_error": str(e)}
-        except httpx.HTTPStatusError:
+        except httpx.HTTPStatusError as e:
+            print(f"\n[DEBUG] HTTP Error: {e.response.status_code} - {e.response.text}")
             if delay is not None:
                 time.sleep(delay)
                 continue
             return None
-        except Exception:
+        except Exception as e:
+            print(f"\n[DEBUG] Request Error: {e}")
             if delay is not None:
                 time.sleep(delay)
                 continue
@@ -203,15 +231,14 @@ def run_episode(episode_num: int, env: LegacyforgeEnvironment) -> dict:
 
     for step_idx in range(1, MAX_ACTIONS + 1):
         time.sleep(3) # Mandatory sleep between EVERY step
-        
+
         current_state = env.state
         history_str = " -> ".join(action_history[-5:]) if action_history else "None"
-        
+
         last_action = action_history[-1] if action_history else None
         # BUG 5 FIX: read from env.state — single source of truth
         read_docs_count = current_state["read_docs_count"]
 
-        # Force action based on what happened last
         if last_action == "read_docs" and read_docs_count >= 1:
             force_hint = "You MUST call edit_function now. Do NOT call read_docs again."
         elif last_action == "edit_function":
@@ -219,16 +246,16 @@ def run_episode(episode_num: int, env: LegacyforgeEnvironment) -> dict:
         elif last_action == "run_tests" and current_state['test_passage_rate'] >= 0.70:
             force_hint = "Passage rate is above 70%. You MUST call submit_test now."
         elif last_action == "run_tests" and current_state['test_passage_rate'] < 0.70:
-            force_hint = "Tests not passing yet. You MUST call edit_function now."
+            # ---> THIS IS THE LINE TO REPLACE <---
+            force_hint = "Tests failing! Call edit_function and provide the ENTIRE FASTAPI MODULE. Do NOT use placeholders or '...'. You must write the complete, functional code!"
         else:
             force_hint = "Start by calling read_docs with topic async or routing."
 
-        # SUGG 2 FIX: history_str was built but never injected — add it back
         user_msg = SYSTEM_PROMPT_TEMPLATE + f"""
-{force_hint}
-
 Recent actions: {history_str}
 read_docs calls this episode: {read_docs_count} / 2 max
+
+HINT: {force_hint}
 
 Current legacy code:
 {obs.legacy_code[:800]}
@@ -241,16 +268,16 @@ Respond with a single JSON object only.
 """
 
         response = call_model(user_msg, rl_hits)
-        
+
         if response is None:
             consecutive_failures += 1
             last_result = "API failure"
             print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ API FAILURE    │ ({consecutive_failures} consecutive)")
             if consecutive_failures >= 3:
-                print(f" 💀 Episode died ({consecutive_failures} consecutive API failures)")
+                print(f"Episode died ({consecutive_failures} consecutive API failures)")
                 break
             continue
-            
+
         consecutive_failures = 0
 
         if "_error" in response or not response:
@@ -260,7 +287,7 @@ Respond with a single JSON object only.
             last_result = f"JSON Parse Error: {err_msg}"
             print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ PARSE ERROR    │ {err_msg[:60]}")
             continue
-            
+
         action = model_response_to_action(response)
         if action is None:
             metrics["parse_errors"] += 1
@@ -268,7 +295,11 @@ Respond with a single JSON object only.
             print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ BAD ACTION     │ {last_result[:60]}")
             continue
 
+        if action.action_type == "edit_function":
+            print(f"\n[DEBUG] FULL Code Injected:\n{'-'*40}\n{action.code}\n{'-'*40}\n")
+
         action_history.append(action.action_type)
+
 
         try:
             obs = env.step(action)
@@ -288,11 +319,11 @@ Respond with a single JSON object only.
             metrics["strategy_quality"] = rb["strategy_quality"]
 
         metrics["actions_taken"] = step_idx
-        
+
         print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ {action.action_type:<15} │ reward {reward:>+6.2f} │ total {metrics['total_reward']:>+6.2f}")
 
         last_result = f"Reward: {reward:.2f}, Info: {obs.info}"
-        
+
         metrics["steps"].append({
             "step":        step_idx,
             "action":      action.action_type,
@@ -308,18 +339,18 @@ Respond with a single JSON object only.
 
         if obs.done:
             metrics["episode_completed"] = True
-            print(f" ✅ Episode complete in {step_idx} steps")
+            print(f"Episode complete in {step_idx} steps")
             break
-            
+
     else:
         if not metrics["episode_completed"] and consecutive_failures < 3:
-            print(f" ⏱️  Episode timed out after {MAX_ACTIONS} steps")
+            print(f"Episode timed out after {MAX_ACTIONS} steps")
 
     metrics["rate_limit_hits"] = rl_hits[0]
-    
+
     if rl_hits[0] > 0:
-        print(f" ⚠️  Rate limited {rl_hits[0]}x this episode")
-    print(f" ❌ Parse errors: {metrics['parse_errors']}")
+        print(f"Rate limited {rl_hits[0]}x this episode")
+    print(f"Parse errors: {metrics['parse_errors']}")
 
     return metrics
 
