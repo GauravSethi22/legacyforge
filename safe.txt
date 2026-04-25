@@ -1,0 +1,25 @@
+.hero {
+    border: 1px solid #3c434d;
+    border-radius: 18px;
+    padding: 24px;
+    background: linear-gradient(140deg, #1f242b 0%, #2f343b 100%);
+    box-shadow: 0 10px 24px rgba(15, 18, 24, 0.2);
+}
+
+.hero h1 {
+    margin: 0;
+    font-family: 'Manrope', sans-serif;
+    font-size: clamp(1.7rem, 3vw, 2.4rem);
+    font-weight: 800;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    color: #ffffff;
+}
+
+.hero p {
+    margin: 8px 0 0;
+    color: #e9edf2;
+    font-size: 1rem;
+    font-weight: 500;
+}
