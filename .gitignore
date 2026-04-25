@@ -1,0 +1,87 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.pyc
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+# Keep uv.lock committed (reproducible installs), but ignore uv cache
+.uv/
+.uv-cache/
+
+# ── Build & Distribution ──────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+wheels/
+
+# ── pytest / Testing ──────────────────────────────────────────────────────────
+.pytest_cache/
+.cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+nosetests.xml
+pytest-results.xml
+
+# ── Type checkers ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+pyrightconfig.json
+.pytype/
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── LegacyForge — Evaluation Outputs ─────────────────────────────────────────
+# Baseline results contain run data; commit intentionally if you want to track them
+server/baseline_results.json
+
+# Scratch / dev scripts — not part of the public API
+server/scratch_smoke_test.py
+server/diag_sandbox.py
+
+# ── LegacyForge — Secrets & Keys ─────────────────────────────────────────────
+.env
+*.env
+.envrc
+secrets.json
+groq_key.txt
+
+# ── Temporary / OS files ──────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.log
+*.orig
+tmp/
+temp/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Keep Dockerfile committed, but ignore local build artifacts
+docker-compose.override.yml
+.dockerignore.local

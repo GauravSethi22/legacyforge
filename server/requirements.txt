@@ -1,0 +1,10 @@
+fastapi
+flask
+pytest
+httpx
+beautifulsoup4
+lxml
+datasketch
+uvicorn
+openenv
+huggingface_hub
