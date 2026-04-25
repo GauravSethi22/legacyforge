@@ -9,6 +9,8 @@ import sys
 import time
 import httpx
 import re
+import random  # Added to randomly select levels for evaluation
+from custom_levels import my_custom_levels
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -45,31 +47,24 @@ SYSTEM_PROMPT_TEMPLATE = """\
 You are migrating a Flask app to FastAPI. Your goal: make ALL tests pass.
 
 THE TESTS EXPECT:
-- A module with `app = FastAPI()` that can be imported
-- GET /items/{item_id} returns 200 with {"item_id": int, "name": str}
-- The `name` MUST be unique per item_id (e.g., f"Item {item_id}")
-- item_id <= 0 MUST return 422 (Validation Error)
-- item_id > 1000 MUST return 404 (Not Found)
-- You MUST use `from fastapi import FastAPI, HTTPException`
-- You MUST use async def
+- A module with `app = FastAPI()` that can be imported.
+- You MUST use `from fastapi import FastAPI, HTTPException, Header, Query` (and any other necessary imports).
+- You MUST use async def.
+- You MUST use Pydantic models for request payloads and responses.
+- YOU MUST MATCH the exact routes, methods, HTTP status codes, and JSON response shapes of the provided legacy Flask code.
 
-TARGET STRUCTURE (this is what passing code looks like):
-from fastapi import FastAPI, HTTPException
+EXAMPLE TARGET STRUCTURE (You MUST adapt this to match the provided legacy code!):
+from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
 
-class ItemResponse(BaseModel):
-    item_id: int
-    name: str
+class ExampleResponse(BaseModel):
+    message: str
 
-@app.get("/items/{item_id}", response_model=ItemResponse)
-async def read_item(item_id: int):
-    if item_id <= 0:
-        raise HTTPException(status_code=422, detail="Item ID must be positive")
-    if item_id > 1000:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return ItemResponse(item_id=item_id, name=f"Item {item_id}")
+@app.get("/example", response_model=ExampleResponse)
+async def read_example():
+    return ExampleResponse(message="Success")
 
 ACTION ORDER:
 1. Call read_docs
@@ -82,53 +77,68 @@ CRITICAL: For edit_function, new_code must be the ENTIRE module -
 all imports, app = FastAPI(), models, and route handlers.
 NOT just a single function.
 
+STRICT JSON RULES:
+1. You must respond with ONLY valid JSON. No conversational text whatsoever.
+2. Any Python code inside "new_code" or "test_code" MUST have all newlines properly escaped as \n.
+3. Do NOT use raw/literal newlines inside JSON strings! It will break the parser.
+
 RESPONSE FORMAT (Strict JSON only, no markdown):
-{"action": "edit_function", "params": {"name": "module", "new_code": "<INSERT_ENTIRE_MODULE_CODE_HERE_AS_ESCAPED_STRING>"}}
+{"action": "edit_function", "params": {"name": "module", "new_code": "<INSERT_ENTIRE_MODULE_CODE_HERE>"}}
+OR
+{"action": "code_review", "params": {"justification": "<EXPLAIN_WHY_TESTS_FAILED>"}}
+OR
+{"action": "submit_test", "params": {"test_code": "def test_adversarial():\n    assert client.get('/items/1001').status_code == 404"}}
 """
 
 def extract_json(text: str) -> dict:
-    # Strip markdown fences
-    text = re.sub(r"```json|```", "", text).strip()
+    # 1. Clean up markdown fences and conversational text
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    clean_text = match.group(0) if match else text.strip()
 
-    # Find all potential JSON objects using regex
-    # This looks for matching curly braces (handling basic nesting)
-    #json_pattern = re.compile(r'\{(?:[^{}]|(?R))*\}')
-
-    # Try the simple approach first: if the whole text parses, use it
+    # 2. Try the standard JSON parser first
     try:
-        return json.loads(text)
+        return json.loads(clean_text, strict=False)
     except json.JSONDecodeError:
         pass
 
-    # If not, extract all { ... } blocks
-    blocks = []
-    depth = 0
-    start = -1
-    for i, char in enumerate(text):
-        if char == '{':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif char == '}':
-            depth -= 1
-            if depth == 0 and start != -1:
-                blocks.append(text[start:i+1])
-                start = -1
+    # 3. DIRTY FALLBACK: Manually slice out the code string.
+    # Small models constantly forget to escape newlines and double quotes.
+    # This manually finds the start and end of the string block to bypass JSON rules.
+    try:
+        action_match = re.search(r'"action"\s*:\s*"([^"]+)"', clean_text)
+        if not action_match:
+            raise ValueError("No action found")
 
-    # Search through the extracted blocks for a valid action
-    last_valid_json = None
-    for block in blocks:
-        try:
-            parsed = json.loads(block)
-            last_valid_json = parsed
-            # If we find a block that specifically has the 'action' key, return it immediately
-            if isinstance(parsed, dict) and "action" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            continue
+        action = action_match.group(1)
 
-    if last_valid_json is not None:
-        return last_valid_json
+        if action == "edit_function":
+            # Find the start of the code string
+            code_start_idx = clean_text.find('"new_code"')
+            quote_start = clean_text.find('"', code_start_idx + 10)
+            # Find the very last quote before the closing braces
+            quote_end = clean_text.rfind('"', quote_start + 1, clean_text.rfind('}'))
+
+            code = clean_text[quote_start+1 : quote_end]
+            # Clean up if the model arbitrarily escaped some things but not others
+            code = code.replace("\\n", "\n").replace('\\"', '"')
+
+            return {"action": "edit_function", "params": {"name": "module", "new_code": code}}
+
+        elif action == "submit_test":
+            code_start_idx = clean_text.find('"test_code"')
+            quote_start = clean_text.find('"', code_start_idx + 11)
+            quote_end = clean_text.rfind('"', quote_start + 1, clean_text.rfind('}'))
+
+            code = clean_text[quote_start+1 : quote_end]
+            code = code.replace("\\n", "\n").replace('\\"', '"')
+
+            return {"action": "submit_test", "params": {"test_code": code}}
+
+        elif action == "code_review":
+            return {"action": "code_review", "params": {"justification": "Tests failed, proceeding to edit."}}
+
+    except Exception as e:
+        raise ValueError(f"Fallback extraction failed: {str(e)}")
 
     raise ValueError("No valid JSON object containing an action was found.")
 
@@ -201,12 +211,17 @@ def model_response_to_action(response: dict) -> LegacyforgeAction | None:
     except Exception:
         return None
 
-def run_episode(episode_num: int, env: LegacyforgeEnvironment) -> dict:
+
+# ---> INTEGRATED DYNAMIC LEVEL INJECTION <---
+def run_episode(episode_num: int, env: LegacyforgeEnvironment, custom_level: dict = None) -> dict:
     print(f"\n{'═'*60}")
-    print(f" EPISODE {episode_num} / {NUM_EPISODES}")
+
+    # Display which level is being evaluated
+    level_name = custom_level["level_name"] if custom_level else "Level 1 (Default)"
+    print(f" EPISODE {episode_num} / {NUM_EPISODES} | Task: {level_name}")
     print(f"{'═'*60}")
 
-    obs = env.reset(level=1)
+    obs = env.reset(level_config=custom_level)
     metrics = {
         "episode":           episode_num,
         "total_reward":      0.0,
@@ -246,8 +261,11 @@ def run_episode(episode_num: int, env: LegacyforgeEnvironment) -> dict:
         elif last_action == "run_tests" and current_state['test_passage_rate'] >= 0.70:
             force_hint = "Passage rate is above 70%. You MUST call submit_test now."
         elif last_action == "run_tests" and current_state['test_passage_rate'] < 0.70:
-            # ---> THIS IS THE LINE TO REPLACE <---
             force_hint = "Tests failing! Call edit_function and provide the ENTIRE FASTAPI MODULE. Do NOT use placeholders or '...'. You must write the complete, functional code!"
+        elif last_action == "code_review":
+            force_hint = "Now that you analyzed the errors, call edit_function and provide the ENTIRE FIXED FASTAPI MODULE."
+        elif last_action == "submit_test":
+            force_hint = "Adversarial test rejected. You MUST call submit_test again and provide valid Pytest code in the 'test_code' parameter."
         else:
             force_hint = "Start by calling read_docs with topic async or routing."
 
@@ -280,12 +298,17 @@ Respond with a single JSON object only.
 
         consecutive_failures = 0
 
+
         if "_error" in response or not response:
             metrics["parse_errors"] += 1
             err_msg = response.get('_error', 'Invalid JSON') if response else 'Empty response'
-            raw_preview = str(response.get('_raw', ''))[:80] if response else ''
+
+            raw_text = str(response.get('_raw', '')) if response else 'None'
+
             last_result = f"JSON Parse Error: {err_msg}"
             print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ PARSE ERROR    │ {err_msg[:60]}")
+
+            print(f"\n[DEBUG] Raw Model Output causing error:\n{'-'*60}\n{raw_text}\n{'-'*60}\n")
             continue
 
         action = model_response_to_action(response)
@@ -365,7 +388,15 @@ def main():
     results = []
 
     for ep in range(1, NUM_EPISODES + 1):
-        metrics = run_episode(ep, env)
+        # Pick a random custom level for this episode
+        level_to_play = random.choice(my_custom_levels)
+
+        # If the level dictionary contains 'None' for code, the environment
+        # will safely fall back to the built-in Level 1 tests.
+        if level_to_play["flask_code"] is None:
+            level_to_play = None
+
+        metrics = run_episode(ep, env, custom_level=level_to_play)
         results.append(metrics)
 
     n = len(results)

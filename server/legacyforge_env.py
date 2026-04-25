@@ -208,12 +208,29 @@ class LegacyforgeEnvironment(Environment):
         self.submit_before_phase2 = False
 
     # -----------------------------------------------------------------------
-    def reset(self, level=None) -> LegacyforgeObservation:
+    # Change reset to accept a dictionary instead of an integer level
+    def reset(self, level_config: dict = None) -> LegacyforgeObservation:
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._init_episode()
-        self.current_level = level if level is not None else 1
 
-        obs_dict = self._build_obs_dict("Initial state — migrate Flask code to FastAPI")
+        # ---> DYNAMIC LEVEL INJECTION <---
+        if level_config:
+            self.working_code = level_config["flask_code"]
+            self.level_test_code = level_config["test_code"]
+            self.golden_code = level_config["golden_code"]
+            self.test_suite_size = level_config.get("test_suite_size", 6)
+            self.current_level = level_config.get("level_name", "custom")
+        else:
+            # Fallback to level 1 if no config is provided
+            self.current_level = 1
+            self.working_code = _LEVEL1_INITIAL_CODE
+            with open(_LEVEL1_TESTS_PATH, "r") as f:
+                self.level_test_code = f.read()
+            with open(os.path.join(os.path.dirname(__file__), "levels", "golden_solution_l1.py"), "r") as f:
+                self.golden_code = f.read()
+            self.test_suite_size = 6
+
+        obs_dict = self._build_obs_dict(f"Initial state — migrate {self.current_level} code to FastAPI")
         return LegacyforgeObservation(
             **obs_dict,
             observation=obs_dict,
@@ -278,9 +295,7 @@ class LegacyforgeEnvironment(Environment):
                 self.run_tests_count += 1
                 summary = "run_tests called without any edits"
             else:
-                with open(_LEVEL1_TESTS_PATH, "r") as f:
-                    test_code = f.read()
-
+                test_code = self.level_test_code
                 result = run_in_sandbox(self.working_code, test_code)
 
                 # --- ADDED DEBUG PRINTS HERE ---
@@ -374,7 +389,7 @@ class LegacyforgeEnvironment(Environment):
                 # --- ADDED DEBUG PRINT FOR SUBMITTED CODE ---
                 print(f"\n{'-'*60}\n[DEBUG submit_test] Submitted Test Code:\n{test_code}\n{'-'*60}\n")
 
-                result = validate_test(test_code, self.working_code)
+                result = validate_test(test_code, self.working_code, self.golden_code)
 
                 # --- ADDED DEBUG PRINT FOR VALIDATION RESULT ---
                 print(f"[DEBUG submit_test] Validation Result:\n{result}\n{'-'*60}\n")

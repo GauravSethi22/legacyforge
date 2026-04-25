@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any, Union
 from pydantic import Field
 from openenv.core.env_server.types import Action, Observation
 
@@ -11,8 +11,9 @@ class LegacyforgeObservation(Observation):
     legacy_code: str = Field(default="", description="The legacy codebase state")
     docs: str = Field(default="", description="Documentation")
     migration_history_summary: str = Field(default="", description="History of migrations performed")
-    level: int = Field(default=1, description="Current environment level")
-    
+
+    level: Union[int, str] = Field(default=1, description="Current environment level")
+
     observation: Optional[Dict[str, Any]] = Field(default=None, description="Nested observation dict")
     reward_breakdown: Optional[Dict[str, Any]] = Field(default=None, description="Breakdown of rewards")
     info: Optional[Dict[str, Any]] = Field(default=None, description="Additional info")
