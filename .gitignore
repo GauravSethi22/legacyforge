@@ -85,3 +85,4 @@ temp/
 # Keep Dockerfile committed, but ignore local build artifacts
 docker-compose.override.yml
 .dockerignore.local
+"*.zip" 
