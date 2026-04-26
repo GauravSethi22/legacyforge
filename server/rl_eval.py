@@ -1,14 +1,17 @@
 """
-baseline_eval.py
-Runs llama-3.1-8b-instant via Groq API
-against LegacyforgeEnvironment for exactly 4 episodes (Levels 1-4) and logs all reward components.
+rl_eval.py
+Runs the locally trained legacyforge-8b-rl-final model via Unsloth
+against LegacyforgeEnvironment for evaluation and logs all reward components.
 """
 import json
 import os
 import sys
 import time
-import httpx
 import re
+import torch
+from unsloth import FastLanguageModel
+
+# Ensure the environment can find your custom modules
 from custom_levels import my_custom_levels
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,30 +20,27 @@ for p in (_ROOT, _HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-GROQ_TOKEN = os.environ.get("GROQ_API_KEY", "").strip()
-if not GROQ_TOKEN:
-    print(
-        "\nERROR: GROQ_API_KEY environment variable is not set.\n"
-        "Get a FREE key (no credit card) at: https://console.groq.com\n"
-        "Then run:\n"
-        "  PowerShell : $env:GROQ_API_KEY = 'gsk_...'; uv run python server/baseline_eval.py\n"
-        "  CMD        : set GROQ_API_KEY=gsk_... && uv run python server/baseline_eval.py\n"
-    )
-    sys.exit(1)
-
 from server.legacyforge_env import LegacyforgeEnvironment  # type: ignore
 from models import LegacyforgeAction  # type: ignore
 
-MODEL_ID       = "Qwen/Qwen2.5-Coder-7B-Instruct"
-NUM_EPISODES   = 4 # Exactly 4 episodes to match the RL Eval
+# --- CONFIGURATION ---
+MODEL_PATH     = os.path.join(_ROOT, "legacyforge-8b-rl-final")
+NUM_EPISODES   = 4 # Exactly 4 episodes
 MAX_ACTIONS    = 20
-OUTPUT_FILE    = os.path.join(_HERE, "baseline_4_levels_results.json")
+OUTPUT_FILE    = os.path.join(_HERE, "rl_eval_results.json")
+MAX_SEQ_LENGTH = 2048
 
-_GROQ_URL = "https://router.huggingface.co/v1/chat/completions"
-_GROQ_HEADERS = {
-    "Authorization": f"Bearer {GROQ_TOKEN}",
-    "Content-Type": "application/json",
-}
+print(f"\nLoading local RL model from '{MODEL_PATH}'...")
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_PATH,
+    max_seq_length=MAX_SEQ_LENGTH,
+    dtype=None,
+    load_in_4bit=True,
+)
+# CRITICAL: Switch to 2x faster inference mode
+FastLanguageModel.for_inference(model)
+print("Model loaded successfully!\n")
+
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are migrating a Flask app to FastAPI. Your goal: make ALL tests pass.
@@ -51,7 +51,6 @@ THE TESTS EXPECT:
 - You MUST use async def.
 - You MUST use Pydantic models for request payloads and responses.
 - YOU MUST MATCH the exact routes, methods, HTTP status codes, and JSON response shapes of the provided legacy Flask code.
-- CRITICAL EXCEPTION RULE: For errors, use standard strings or dicts in HTTPExceptions: `raise HTTPException(status_code=404, detail="Not found")`. DO NOT pass Pydantic models into the detail field!
 
 CRITICAL FOR submit_test:
 - A global `client` (FastAPI TestClient) is ALREADY provided in the test environment.
@@ -118,57 +117,32 @@ def extract_json(text: str) -> dict:
     except json.JSONDecodeError as e:
         raise ValueError(f"Extracted block is not valid JSON: {str(e)}")
 
+def call_model(user_msg: str) -> dict | None:
+    messages = [{"role": "user", "content": user_msg}]
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
 
-def call_model(user_msg: str, rate_limit_hits: list) -> dict | None:
-    payload = {
-        "model": MODEL_ID,
-        "messages": [
-            {"role": "user", "content": user_msg},
-        ],
-        "max_tokens": 1500, # Increased context
-        "temperature": 0.2,
-    }
+    try:
+        outputs = model.generate(
+            input_ids=inputs,
+            max_new_tokens=1500, # Increased to match RL config
+            use_cache=True,
+            temperature=0.1,
+            pad_token_id=tokenizer.eos_token_id
+        )
 
-    backoff_delays = [5, 15, 30]
+        raw = tokenizer.batch_decode(outputs[:, inputs.shape[1]:], skip_special_tokens=True)[0]
+        return extract_json(raw)
 
-    for attempt in range(len(backoff_delays) + 1):
-        delay = backoff_delays[attempt] if attempt < len(backoff_delays) else None
-        raw = ""
-        try:
-            resp = httpx.post(
-                _GROQ_URL,
-                headers=_GROQ_HEADERS,
-                json=payload,
-                timeout=60,
-            )
-            if resp.status_code == 429:
-                if delay is not None:
-                    rate_limit_hits[0] += 1
-                    time.sleep(delay)
-                    continue
-                else:
-                    return None  # all retries exhausted
-            resp.raise_for_status()
-
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            return extract_json(raw)
-
-        except (json.JSONDecodeError, ValueError) as e:
-            return {"_raw": raw, "_error": str(e)}
-        except httpx.HTTPStatusError as e:
-            print(f"\n[DEBUG] HTTP Error: {e.response.status_code} - {e.response.text}")
-            if delay is not None:
-                time.sleep(delay)
-                continue
-            return None
-        except Exception as e:
-            print(f"\n[DEBUG] Request Error: {e}")
-            if delay is not None:
-                time.sleep(delay)
-                continue
-            return None
-
-    return None  # exhausted all retries
+    except (json.JSONDecodeError, ValueError) as e:
+        return {"_raw": raw, "_error": str(e)}
+    except Exception as e:
+        print(f"\n[DEBUG] Local Inference Error: {e}")
+        return None
 
 def model_response_to_action(response: dict) -> LegacyforgeAction | None:
     try:
@@ -187,7 +161,6 @@ def model_response_to_action(response: dict) -> LegacyforgeAction | None:
         )
     except Exception:
         return None
-
 
 def run_episode(episode_num: int, env: LegacyforgeEnvironment, custom_level: dict = None) -> dict:
     print(f"\n{'═'*60}")
@@ -209,19 +182,14 @@ def run_episode(episode_num: int, env: LegacyforgeEnvironment, custom_level: dic
         "phase2_unlocked":   False,
         "episode_completed": False,
         "parse_errors":      0,
-        "rate_limit_hits":   0,
         "steps":             [],
     }
 
     last_result = "None"
     action_history = []
-    rl_hits = [0]
-    consecutive_failures = 0
     last_submit_reason = None
 
     for step_idx in range(1, MAX_ACTIONS + 1):
-        time.sleep(3) # Mandatory sleep between EVERY step to respect Groq limits
-
         current_state = env.state
         history_str = " -> ".join(action_history[-5:]) if action_history else "None"
 
@@ -266,19 +234,12 @@ Last action result: {last_result}
 
 Respond with a single JSON object only.
 """
-
-        response = call_model(user_msg, rl_hits)
+        response = call_model(user_msg)
 
         if response is None:
-            consecutive_failures += 1
-            last_result = "API failure"
-            print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ API FAILURE    │ ({consecutive_failures} consecutive)")
-            if consecutive_failures >= 3:
-                print(f"Episode died ({consecutive_failures} consecutive API failures)")
-                break
+            last_result = "Inference failure"
+            print(f" Step {step_idx:2d} │ Phase {current_state['phase']} │ Passage {current_state['test_passage_rate']:5.2f} │ ❌ INFERENCE FAIL │ ")
             continue
-
-        consecutive_failures = 0
 
         if "_error" in response or not response:
             metrics["parse_errors"] += 1
@@ -351,21 +312,16 @@ Respond with a single JSON object only.
             break
 
     else:
-        if not metrics["episode_completed"] and consecutive_failures < 3:
+        if not metrics["episode_completed"]:
             print(f"Episode timed out after {MAX_ACTIONS} steps")
 
-    metrics["rate_limit_hits"] = rl_hits[0]
-
-    if rl_hits[0] > 0:
-        print(f"Rate limited {rl_hits[0]}x this episode")
     print(f"Parse errors: {metrics['parse_errors']}")
-
     return metrics
 
 
 def main():
-    print(f"\nLegacyForge Baseline Evaluation (4 Levels)")
-    print(f"Model : {MODEL_ID}")
+    print(f"\nLegacyForge RL Model Evaluation (4 Levels)")
+    print(f"Model : {MODEL_PATH}")
     print(f"Episodes: {NUM_EPISODES}  |  Max actions/episode: {MAX_ACTIONS}")
     print(f"Output: {OUTPUT_FILE}\n")
 
@@ -394,10 +350,9 @@ def main():
     oracle_hits   = sum(1 for r in results if r["oracle_penalty"] > 0)
     completed     = sum(1 for r in results if r["episode_completed"])
     tot_parse_err = sum(r["parse_errors"] for r in results)
-    tot_rl_hits   = sum(r["rate_limit_hits"] for r in results)
 
     print(f"\n{'═'*60}")
-    print(" BASELINE EVALUATION SUMMARY")
+    print(" RL TRAINED EVALUATION SUMMARY")
     print(f"{'═'*60}")
     print(f" Episodes run          : {n}")
     print(f" Avg total reward      : {avg_reward:+.3f}")
@@ -408,18 +363,10 @@ def main():
     print(f" Oracle penalty hits   : {oracle_hits} / {n}")
     print(f" Avg actions/episode   : {avg_actions:.1f}")
     print(f" Total parse errors    : {tot_parse_err}")
-    print(f" Total rate limit hits : {tot_rl_hits}")
     print(f"{'═'*60}")
-    print(f"\n OFFICIAL BASELINE SCORES (save these before training)")
-    print(f"────────────────────────────────────────────────────────────")
-    print(f" avg_total_reward      : {avg_reward:.3f}")
-    print(f" avg_test_passage_rate : {avg_passage:.3f}")
-    print(f" avg_strategy_quality  : {avg_strategy:.3f}")
-    print(f" phase2_unlock_rate    : {(phase2_rate/n)*100:.2f}%")
-    print(f"{'═'*60}\n")
 
     output = {
-        "model":    MODEL_ID,
+        "model":    MODEL_PATH,
         "episodes": NUM_EPISODES,
         "summary": {
             "avg_total_reward":    round(avg_reward,   4),
@@ -430,7 +377,6 @@ def main():
             "episodes_completed":  f"{completed} / {n}",
             "oracle_penalty_rate": f"{oracle_hits} / {n}",
             "total_parse_errors":  tot_parse_err,
-            "total_rate_limit_hits": tot_rl_hits,
         },
         "episodes_detail": results,
     }

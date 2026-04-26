@@ -289,85 +289,82 @@ class LegacyforgeEnvironment(Environment):
                 self.run_tests_after_every_edit = False
 
         elif action_type == "run_tests":
+            # 1. Always run the tests so the agent gets the logs
+            test_code = self.level_test_code
+            result = run_in_sandbox(self.working_code, test_code)
+
+            # --- ADDED DEBUG PRINTS HERE ---
+            print(f"\n{'-'*60}\n[DEBUG run_tests] Pytest Output:\n{result.get('output', '')}")
+            if result.get('error'):
+                print(f"\n[DEBUG run_tests] Pytest Errors:\n{result.get('error', '')}")
+            print(f"{'-'*60}\n")
+
+            # 2. Penalize spamming tests without editing, but DO NOT block the output
             if not self.edited_since_last_test:
-                # BUG 2 FIX: still count the attempt even when no edits preceded it
                 reward = -0.5
-                self.run_tests_count += 1
                 summary = "run_tests called without any edits"
             else:
-                test_code = self.level_test_code
-                result = run_in_sandbox(self.working_code, test_code)
+                reward = 0.0 # Will be updated by progress bonuses below
+                summary = ""
 
-                # --- ADDED DEBUG PRINTS HERE ---
-                print(f"\n{'-'*60}\n[DEBUG run_tests] Pytest Output:\n{result.get('output', '')}")
-                if result.get('error'):
-                    print(f"\n[DEBUG run_tests] Pytest Errors:\n{result.get('error', '')}")
-                print(f"{'-'*60}\n")
+            self.run_tests_count += 1
 
-                # Determine if the sandbox actually produced parseable results
-                sandbox_ok = not result["timed_out"] and not (
-                    not result["passed"] and "SyntaxError" in result.get("error", "")
-                )
+            sandbox_ok = not result["timed_out"] and not (
+                not result["passed"] and "SyntaxError" in result.get("error", "")
+            )
 
-                if result["timed_out"]:
-                    reward = -1.0
-                    self.test_passage_rate = 0.0
-                elif not sandbox_ok:
-                    # Hard failure (SyntaxError or compile crash)
-                    reward = -0.5
-                    self.test_passage_rate = 0.0
-                else:
-                    output = result["output"]
+            if result["timed_out"]:
+                reward -= 1.0
+                self.test_passage_rate = 0.0
+            elif not sandbox_ok:
+                reward -= 0.5
+                self.test_passage_rate = 0.0
+            else:
+                output = result["output"]
+                passed_match = re.search(r"={2,}.*?(\d+)\s+passed", output)
+                failed_match = re.search(r"={2,}.*?(\d+)\s+failed", output)
 
-                    # More strict regex targeting the pytest summary line
-                    passed_match = re.search(r"={2,}.*?(\d+)\s+passed", output)
-                    failed_match = re.search(r"={2,}.*?(\d+)\s+failed", output)
+                raw_passed = int(passed_match.group(1)) if passed_match else (self.test_suite_size if result["passed"] else 0)
+                raw_failed = int(failed_match.group(1)) if failed_match else (0 if result["passed"] else self.test_suite_size)
 
-                    raw_passed = int(passed_match.group(1)) if passed_match else (self.test_suite_size if result["passed"] else 0)
-                    raw_failed = int(failed_match.group(1)) if failed_match else (0 if result["passed"] else self.test_suite_size)
+                passed = min(raw_passed, self.test_suite_size)
+                failed = min(raw_failed, self.test_suite_size)
+                total_tests = passed + failed or self.test_suite_size
 
-                    # FIX: Cap the parsed results to prevent spoofing exploits
-                    passed = min(raw_passed, self.test_suite_size)
-                    failed = min(raw_failed, self.test_suite_size)
-                    total_tests = passed + failed or self.test_suite_size
+                delta_passed = passed - self.max_passed
+                if delta_passed > 0:
+                    reward += delta_passed * 0.5
+                    self.max_passed = passed
 
-                    delta_passed = passed - self.max_passed
-                    if delta_passed > 0:
-                        reward = delta_passed * 0.5
-                        self.max_passed = passed
-                    else:
-                        reward = 0.0
+                reward -= failed * 0.2
+                self.test_passage_rate = passed / total_tests
+                self.history.update_from_output(output + result.get("error", ""))
 
-                    reward -= failed * 0.2
-                    self.test_passage_rate = passed / total_tests
-                    self.history.update_from_output(output + result.get("error", ""))
+                if self.test_passage_rate >= 0.33 and "33" not in self.passage_milestones_hit:
+                    progress_bonus += 0.5
+                    self.passage_milestones_hit.add("33")
+                if self.test_passage_rate >= 0.67 and "67" not in self.passage_milestones_hit:
+                    progress_bonus += 0.5
+                    self.passage_milestones_hit.add("67")
+                if self.test_passage_rate >= 1.00 and "100" not in self.passage_milestones_hit:
+                    progress_bonus += 1.0
+                    self.passage_milestones_hit.add("100")
 
-                    # BUG 1 FIX: milestone bonuses only on a successful sandbox run
-                    if self.test_passage_rate >= 0.33 and "33" not in self.passage_milestones_hit:
-                        progress_bonus += 0.5
-                        self.passage_milestones_hit.add("33")
-                    if self.test_passage_rate >= 0.67 and "67" not in self.passage_milestones_hit:
-                        progress_bonus += 0.5
-                        self.passage_milestones_hit.add("67")
-                    if self.test_passage_rate >= 1.00 and "100" not in self.passage_milestones_hit:
-                        progress_bonus += 1.0
-                        self.passage_milestones_hit.add("100")
+                if self.test_passage_rate >= 0.70 and self.phase == 1:
+                    self.phase = 2
+                    progress_bonus += 1.0
 
-                    if self.test_passage_rate >= 0.70 and self.phase == 1:
-                        self.phase = 2
-                        progress_bonus += 1.0
+                reward += progress_bonus
+                if not summary:
+                    summary = f"run_tests: passage={self.test_passage_rate:.2f}"
 
-                    reward += progress_bonus
-
-                self.edited_since_last_test = False
-                self.run_tests_count += 1
-                summary = f"run_tests: passage={self.test_passage_rate:.2f}"
-                info.update({
-                    "passed": result.get("passed", False),
-                    "timed_out": result.get("timed_out", False),
-                    "test_passage_rate": self.test_passage_rate,
-                    "phase": self.phase,
-                })
+            self.edited_since_last_test = False
+            info.update({
+                "passed": result.get("passed", False),
+                "timed_out": result.get("timed_out", False),
+                "test_passage_rate": self.test_passage_rate,
+                "phase": self.phase,
+            })
 
         elif action_type == "code_review":
             self.code_review_count += 1
@@ -386,26 +383,20 @@ class LegacyforgeEnvironment(Environment):
             else:
                 test_code = action.code or ""
 
-                # --- ADDED DEBUG PRINT FOR SUBMITTED CODE ---
                 print(f"\n{'-'*60}\n[DEBUG submit_test] Submitted Test Code:\n{test_code}\n{'-'*60}\n")
-
                 result = validate_test(test_code, self.working_code, self.golden_code)
-
-                # --- ADDED DEBUG PRINT FOR VALIDATION RESULT ---
                 print(f"[DEBUG submit_test] Validation Result:\n{result}\n{'-'*60}\n")
 
                 reason = result.get("reason", "unknown")
+
+                reward = result.get("reward", 0.0)
+
                 if result.get("accepted"):
-                    reward = 3.0
-                    adversarial_bonus = 3.0
+                    adversarial_bonus = reward
                     done = True
-                elif reason == "unfair_test":
-                    reward = -1.0
                 elif reason == "broken_logic":
-                    reward = -2.0
-                    oracle_penalty = -2.0
-                elif reason == "too_easy":
-                    reward = 0.0
+                    oracle_penalty = reward
+
                 summary = f"submit_test:{reason}"
                 info["validation"] = result
 

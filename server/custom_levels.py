@@ -155,7 +155,7 @@ class SearchResult(BaseModel):
     results: List[str]
 
 @app.get("/search", response_model=SearchResult)
-async def search_items(q: str, limit: int = 10):
+async def search_items(q: str = Query(..., min_length=1), limit: int = 10):
     results = [f"Result for {q}"] * limit
     return SearchResult(query=q, count=limit, results=results)
 """

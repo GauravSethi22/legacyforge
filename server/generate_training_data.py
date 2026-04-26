@@ -9,7 +9,7 @@ import sys
 import time
 import httpx
 import re
-import random  # Added for dynamic levels and diverse hints
+import random
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -18,18 +18,21 @@ for p in (_ROOT, _HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# This will now pull your Hugging Face token from the terminal
 GROQ_TOKEN = os.environ.get("GROQ_API_KEY", "").strip()
 
 from server.legacyforge_env import LegacyforgeEnvironment
 from models import LegacyforgeAction
-from server.custom_levels import my_custom_levels # Pulling in the dynamic dataset
+from server.custom_levels import my_custom_levels
 
-MODEL_ID       = "llama-3.3-70b-versatile"
-NUM_EPISODES   = 150 # Set this to whatever you need
+# ---> FIX: Exact model ID from your Colab notebook <---
+MODEL_ID       = "meta-llama/Llama-3.3-70B-Instruct"
+NUM_EPISODES   = 150
 MAX_ACTIONS    = 20
 OUTPUT_FILE    = os.path.join(_HERE, "sft_dataset.json")
 
-_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ---> FIX: The exact router URL from your Colab notebook (with chat/completions appended) <---
+_GROQ_URL = "https://router.huggingface.co/v1/chat/completions"
 _GROQ_HEADERS = {
     "Authorization": f"Bearer {GROQ_TOKEN}",
     "Content-Type": "application/json",
@@ -44,6 +47,10 @@ THE TESTS EXPECT:
 - You MUST use async def.
 - You MUST use Pydantic models for request payloads and responses.
 - YOU MUST MATCH the exact routes, methods, HTTP status codes, and JSON response shapes of the provided legacy Flask code.
+
+CRITICAL FOR submit_test:
+- A global `client` (FastAPI TestClient) is ALREADY provided in the test environment.
+- DO NOT import `TestClient`, `app`, or your module inside the test code. Just write the test function using the global `client`.
 
 EXAMPLE TARGET STRUCTURE (You MUST adapt this to match the provided legacy code!):
 from fastapi import FastAPI
@@ -64,6 +71,7 @@ ACTION ORDER:
 3. Call run_tests
 4. If passage < 70%, call code_review to analyze the test failures, THEN call edit_function again.
 5. If passage >= 70%, call submit_test
+6. If submit_test fails, read the "Last action result" to see the Pytest error. Fix the bug in your test code and submit again. DO NOT edit the API.
 
 CRITICAL: For edit_function, new_code must be the ENTIRE module -
 all imports, app = FastAPI(), models, and route handlers.
@@ -83,17 +91,14 @@ OR
 """
 
 def extract_json(text: str) -> dict:
-    # 1. Clean up markdown fences and conversational text
     match = re.search(r'\{.*\}', text, re.DOTALL)
     clean_text = match.group(0) if match else text.strip()
 
-    # 2. Try the standard JSON parser first
     try:
         return json.loads(clean_text, strict=False)
     except json.JSONDecodeError:
         pass
 
-    # 3. DIRTY FALLBACK: Manually slice out the code string.
     try:
         action_match = re.search(r'"action"\s*:\s*"([^"]+)"', clean_text)
         if not action_match:
@@ -140,10 +145,9 @@ def call_model(user_msg: str) -> dict | None:
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": user_msg}],
         "max_tokens": 1024,
-        "temperature": 0.7, # Keep high for diverse trajectory generation
+        "temperature": 0.7,
     }
 
-    # Much more aggressive backoff for unattended data generation
     backoff_delays = [5, 15, 30, 60, 60]
 
     for attempt in range(len(backoff_delays) + 1):
@@ -190,21 +194,23 @@ def model_response_to_action(response: dict) -> LegacyforgeAction | None:
         return None
 
 def run_dynamic_episode(env: LegacyforgeEnvironment, custom_level: dict = None) -> list | None:
-    # Pass the config dictionary to the environment
     obs = env.reset(level_config=custom_level)
     action_history = []
     trajectory = []
     last_result = "None"
 
+    # --- NEW: Track the specific reason the test failed ---
+    last_submit_reason = None
+    failed_submits = 0
+
     for step_idx in range(1, MAX_ACTIONS + 1):
-        time.sleep(3) # Groq rate limit buffer
+        time.sleep(3)
         current_state = env.state
         history_str = " -> ".join(action_history[-5:]) if action_history else "None"
 
         last_action = action_history[-1] if action_history else None
         read_docs_count = current_state["read_docs_count"]
 
-        # Dynamic Hint Logic integrated with code_review
         if last_action == "read_docs" and read_docs_count >= 1:
             force_hint = "You MUST call edit_function now. Do NOT call read_docs again."
         elif last_action == "edit_function":
@@ -216,9 +222,16 @@ def run_dynamic_episode(env: LegacyforgeEnvironment, custom_level: dict = None) 
         elif last_action == "code_review":
             force_hint = "Now that you analyzed the errors, call edit_function and provide the ENTIRE FIXED FASTAPI MODULE."
         elif last_action == "submit_test":
-            force_hint = "Adversarial test rejected. You MUST call submit_test again and provide valid Pytest code in the 'test_code' parameter."
+            # --- FIX: Tell the model exactly what to do based on the rejection reason ---
+            if last_submit_reason == "agent_code_failing":
+                force_hint = "Your FastAPI code has a bug! It failed the valid test you just wrote (error shown below). You MUST call edit_function to fix your API implementation."
+            elif last_submit_reason == "broken_logic":
+                force_hint = "Your test code has a bug! It failed against the golden solution. DO NOT call edit_function. Fix your test code using the global `client` and call submit_test again."
+            elif last_submit_reason == "too_easy":
+                force_hint = "Your test is too weak and didn't catch the hidden bugs. DO NOT call edit_function. Write a stricter test with more assertions and call submit_test again."
+            else:
+                force_hint = "Adversarial test rejected! Fix it and call submit_test again."
         else:
-            # Randomized starting hints for diverse SFT data
             start_choices = [
                 "Start by calling read_docs with topic 'routing'.",
                 "Start by calling read_docs with topic 'pydantic'.",
@@ -235,7 +248,7 @@ read_docs calls this episode: {read_docs_count} / 2 max
 HINT: {force_hint}
 
 Current legacy code:
-{obs.legacy_code[:800]}
+{obs.legacy_code}
 
 Current passage rate: {current_state['test_passage_rate']:.2f}
 Current phase: {current_state['phase']}
@@ -260,24 +273,34 @@ Respond with a single JSON object only.
         action_history.append(action.action_type)
         obs = env.step(action)
 
-        # -------------------------------------------------------------
-        # Update last_result based on the environment's response to the action
-        # -------------------------------------------------------------
         if action.action_type == "submit_test":
             val = obs.info.get("validation", {})
+            # Save the reason so the next prompt knows how to instruct the model
+            last_submit_reason = val.get("reason", "unknown")
+
             if not val.get("accepted"):
-                # Grab the last 500 characters of the Pytest log to show the model the error
                 error_log = str(val.get('details', ''))[-500:]
-                last_result = f"Adversarial test rejected! Pytest output:\n{error_log}"
+                last_result = f"Adversarial test rejected (Reason: {last_submit_reason})! Pytest output:\n{error_log}"
+
+                failed_submits += 1
+                if failed_submits >= 4:
+                    print(f"  ❌ Stuck in an error loop. Aborting episode to save API credits.")
+                    return None
+            else:
+                failed_submits = 0 # reset on success
+
         elif action.action_type == "run_tests":
             last_result = f"Tests executed. Passage: {env.state['test_passage_rate']:.2f}"
+            failed_submits = 0 # Reset if we went back to testing
+        elif action.action_type == "edit_function":
+            last_result = f"API Code updated successfully."
+            failed_submits = 0 # Reset if we went back to editing
         else:
             last_result = f"Action {action.action_type} executed."
 
         print(f"  Step {step_idx:2d} | Action: {action.action_type:<15} | Passage: {env.state['test_passage_rate']:.2f} | Phase: {env.state['phase']}")
 
         if obs.done:
-            # Check if the episode ended because the adversarial test was accepted
             if action.action_type == "submit_test" and obs.info.get("validation", {}).get("accepted"):
                 print(f"  ✅ Perfect run! Tests passed and adversarial test succeeded.")
                 return trajectory
@@ -294,13 +317,11 @@ def main():
     dataset = []
 
     for ep in range(1, NUM_EPISODES + 1):
-        # Pick a random custom level for this episode
         level_to_play = random.choice(my_custom_levels)
         level_name = level_to_play["level_name"] if level_to_play and "level_name" in level_to_play else "Level 1"
 
         print(f"[{ep}/{NUM_EPISODES}] Starting Episode... (Task: {level_name})")
 
-        # Safe fallback to level 1
         if level_to_play and level_to_play.get("flask_code") is None:
             level_to_play = None
 
@@ -310,7 +331,6 @@ def main():
             dataset.append({"conversations": trajectory})
             print(f"--> Saved! Total perfect runs collected: {len(dataset)}\n")
 
-            # Save incrementally just in case you stop it early
             with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
                 json.dump(dataset, f, indent=2)
         else:
