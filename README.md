@@ -342,7 +342,13 @@ python server/generate_training_data.py
 python server/generate_golden_data.py
 ```
 
+## Blog
+Click Here ([./blog.md](./blog.md))
 ---
+
+## Colab link
+Click here ([https://colab.research.google.com/drive/1laql7j2QKwFfEXIVlkt1FgHK-lmvr8Qx?usp=sharing](https://colab.research.google.com/drive/1laql7j2QKwFfEXIVlkt1FgHK-lmvr8Qx?usp=sharing))
+
 
 ## Project Structure
 
@@ -377,5 +383,4 @@ legacyforge/
         ├── level1_answer.py           # Level 1 reference answer
         └── golden_solution_l1.py      # Level 1 golden solution
 ```
-
 ---
